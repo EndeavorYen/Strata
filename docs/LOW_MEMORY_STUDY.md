@@ -247,6 +247,8 @@ tok/s ≈ 1 ÷ 每個 token 的時間
 
 1＋3 疊加，16/16 的機器上限可能到約 30–35 tok/s；2 和 5 還能再加，但沒有數據前不估。
 
+這些機制多數已經有相關研究，見第 8 節。
+
 ### 物理下限
 
 - **DRAM 不會降到 0。** Windows、server、engine 的 buffer 大約要 6–10 GB。能降的是「experts 占用的 DRAM」。
@@ -281,3 +283,79 @@ tok/s ≈ 1 ÷ 每個 token 的時間
 - 一個 verify window（約 3.5 個 token）裡，不重複的 experts 有多少？
 - 在這台機器上，Q2_0 budget 模式實際是多少 tok/s？
 - 冷 experts 降到約 1.2 bpw，KL 會增加多少？
+
+---
+
+## 8. 相關研究
+
+2026-10-03 上網查的，內容整理自各論文的 arXiv 摘要或 HTML 版本，我沒有自己重現。表中的數字都是**作者在他們自己的硬體和模型上量的**，不能直接換算成 Strata 的數字。
+
+### 8.1 基礎：MoE offloading 怎麼開始的
+
+| 論文 | 時間 | 重點 | 和 Strata 的關係 |
+|---|---|---|---|
+| [Fast Inference of MoE LMs with Offloading](https://arxiv.org/abs/2312.17238)（Eliseev、Mazur） | 2023-12 | Mixtral-8x7B 跑在桌機 GPU 上：GPU 放 experts 的 LRU 快取，加上 speculative prefetch。觀察到相鄰 token 會重複用到相同的 experts，而且前面幾層的 hidden state 已經「知道」後面幾層要用哪些 experts | Strata 的 GPU expert cache 和 lookahead prefetch 都是這條路線 |
+| [Fiddler](https://arxiv.org/abs/2402.07033)（ICLR 2025） | 2024-02 | 沒命中的 expert 直接由 CPU 算，不搬權重到 GPU。單張 24 GB GPU 跑未壓縮的 Mixtral-8x7B（>90 GB），超過 3 tok/s | Strata「CPU 在 RAM 裡就地計算 miss」的同一個想法 |
+| [KTransformers](https://github.com/kvcache-ai/ktransformers)（SOSP 2025） | 2025 | attention 放 GPU，experts 放 CPU/DRAM，搭配 AMX/AVX-512 kernel。單張 24 GB GPU 加上約 512 GB RAM，跑 DeepSeek-R1/V3 671B | CPU/GPU 混合推論的代表，但需要大量 DRAM |
+| [LLM in a flash](https://arxiv.org/abs/2312.11514)（Apple，ACL 2024） | 2023-12 | 權重放在 flash，按需載入 DRAM。windowing 重用最近活化過的神經元；row-column bundling 讓每次讀取的區塊更大。可以跑大到 DRAM 2 倍的模型 | 機制 #6（只讀部分 rows）的出處 |
+
+### 8.2 冷 experts 用低精度（對應機制 #1）
+
+**這個方向已經有人做過，而且有正面結果。** 要實作的話，從這幾篇開始讀。
+
+| 論文 | 時間 | 重點 | 作者報告的數字 |
+|---|---|---|---|
+| [HOBBIT](https://arxiv.org/abs/2411.01433) | 2024-11 | 每個 expert 存好幾種精度；沒命中、而且不重要的 expert，改從 CPU 記憶體或 SSD 讀低精度版本（FP16→INT4、INT8→INT2）。另有逐層預測 prefetch，以及多維度的快取策略 | expert 載入 I/O 最多減少 4 倍；桌機 GPU 上 decode 快 3–4 倍；精度損失很小（Mixtral、Phi-MoE） |
+| [DynaExq](https://arxiv.org/abs/2511.15015) | 2025-11（2026-09 修訂） | 依執行時的流量決定精度：常用的 experts 用高精度常駐，其他保留一份低精度備援 | Qwen3-80B MoE 的準確率，比靜態 PTQ 從 73.09% 提高到 77.57% |
+| [Low-Rank Compensation](https://arxiv.org/abs/2512.17073) | 2025-12 | 所有 experts 都存低 bit；router 挑出最重要的 n 個（n < k）時，再傳一份小的 low-rank 補償因子把精度補回來 | 摘要只說 bandwidth 和準確率的取捨更好，沒有具體數字 |
+
+### 8.3 SSD 當第三層（對應機制 #3、#4）
+
+| 論文 | 時間 | 重點 | 作者報告的數字 |
+|---|---|---|---|
+| [SSD-LLaMA](https://arxiv.org/abs/2609.18110) | 2026-09 | **最接近我們的問題**。主要測試機：RTX 5090 32 GB、**16 GB DRAM**、PCIe 5.0 NVMe（循序讀 9 GiB/s）。做法：(1) expert-pack layout，把一個 expert 的權重排成連續區塊，一次 `O_DIRECT` 讀完；(2) 用 rANS 做無損壓縮，在 GPU 上解壓；(3) SSD/RAM/VRAM 三層快取（看 recency 和 frequency）；(4) CPU/GPU 的動態分工 | 無損壓縮讓 SSD 流量少了 33.2%（每 token 從 8.89 GB 降到 5.93 GB）；SSD 達到循序頻寬峰值的 77.7%（baseline 43.2%）；decode 比 llama.cpp 快 2.10–15.58 倍；Kimi-K3（2.8T 參數）decode 0.465 tok/s |
+| [FlashMoE](https://arxiv.org/abs/2601.17063) | 2026-01 | experts 放在 SSD；用一個小的 ML 模型結合 recency 和 frequency，決定快取要換掉誰 | 命中率比 LRU/LFU 最多高 51%；最多快 2.6 倍 |
+| [SSD Offloading … Considered Harmful in Energy Efficiency](https://arxiv.org/abs/2508.06978) | 2025-08 | 從**耗電**角度看：SSD 每 bit 的讀取能耗比 DRAM 高很多 | 每個 token 的能耗最多是 HBM baseline 的約 12 倍；prefetch 可以藏住延遲，但省不了電 |
+| [Memory-Sovereign Inference](https://arxiv.org/abs/2608.23805) | 2026-08 | 用 Qwen3-Next（48 × 512 個 layer-expert，**和本專案的模型形狀相同**）做儲存支援的推論，重點是怎麼**嚴格驗證**記憶體用量和輸出正確性。指出常見量法的漏洞：行程的記憶體讀數不含 page cache；能生成不代表非同步路徑是對的 | host 11 GiB + GPU 24 GiB；64 個 token 範圍內的 logits 完全一致 |
+
+SSD-LLaMA 的兩個做法可以直接對照 Strata：
+- **expert-pack + `O_DIRECT`**：對應機制 #4。Strata 的 `experts.bin` 本來就是每個 expert 連續存放，差別在 decode 時走的是 mmap。
+- **無損壓縮省 33%**：我之前沒有把壓縮列進機制表。他們的模型權重格式和 Strata 的 2–3 bit i-quant 不同，量化很重的權重還能壓多少，要自己測。
+
+### 8.4 預測、快取策略、路由局部性（對應機制 #2、#5）
+
+| 論文 | 時間 | 重點 | 作者報告的數字 |
+|---|---|---|---|
+| [Not All Models Suit Expert Offloading](https://arxiv.org/abs/2505.16056) | 2025-05（2026-02 修訂） | 分析 20 個 MoE 模型的「局部路由一致性」，也就是一段連續 token 會不會一直用同一批 experts。有 shared expert 的模型一致性較低；experts 依領域分工的模型比依詞彙分工的好 | 多數模型的快取大小約為啟用 experts 數的 2 倍時，效果和成本比較平衡 |
+| [DALI](https://arxiv.org/abs/2602.03495) | 2026-02 | 本地 PC：用 0-1 整數最佳化（貪婪解）動態分配 CPU/GPU 的工作；利用層與層之間的 residual 預測接下來的高負載 experts；快取替換也考慮 workload | 摘要只說「顯著加速」 |
+| [ReMoE](https://arxiv.org/abs/2605.27081) | 2026-05 | **微調 router**，讓它偏好最近用過的 experts，路由在時間上更穩定，重用率更高 | expert 重用率 +26%；Jetson Orin NX 上 TPOT 少 43.6–49.8%；作者報告下游任務的表現維持不變 |
+| [Importance-Driven Expert Scheduling](https://arxiv.org/abs/2508.18983) | 2025-08 | 被選中但不重要、又沒命中的 expert，換成 GPU 上已經有、功能相近的 expert | decode 延遲少 48%，命中率超過 60%，準確率「幾乎無損」 |
+| [Mixture of Cache-Conditional Experts](https://arxiv.org/abs/2412.00099) | 2024-12 | 路由時優先選已經在快取裡的 experts，不嚴格照 top-K | 行動裝置 |
+| [Cache-Aware Joint Router Adaptation](https://arxiv.org/abs/2609.04895) | 2026-09 | 用 post-training 調整 backbone 和小型輔助 router，讓快取更有效，推論時仍維持原本的 top-K 規則 | — |
+
+這幾篇和機制 #5（miss 時減少 top-k）是同一類：都在**改變模型的計算**，換取更少的 I/O。差別在於「跳過」、「換成相近的」，還是「訓練 router 讓它自己偏好快取裡的」。
+
+### 8.5 其他值得一看
+
+- [MoBiLE](https://arxiv.org/abs/2510.12357)（2025-10）：消費級 GPU 上的 offloading，混用「大」和「小」的 experts。
+- [CPU-GPU Collaborative Inference on Memory-Limited Systems](https://arxiv.org/abs/2512.16473)（2025-12）：GPU expert cache 加上 CPU 協同計算。
+- [CoX-MoE](https://arxiv.org/abs/2605.17889)（DAC 2026）：AMX CPU 和 GPU 協同執行，把 expert 的計算合併起來做。
+- [Automated Tensor Scheduling for Hybrid CPU-GPU Inference on Consumer Devices](https://arxiv.org/abs/2607.10183)（2026-07）。
+- 論文清單：[awesome-moe-inference](https://github.com/MoE-Inf/awesome-moe-inference/)。
+
+### 8.6 對這份筆記的影響
+
+1. **機制 #1（冷 experts 低精度）**：HOBBIT 和 DynaExq 已經證明可行，難點會在 Strata 本身的格式已經是 2–3 bit，比這些論文的 INT4/INT8 起點低很多，還能往下降多少不確定。
+2. **機制 #3／#4（SSD 頻寬）**：SSD-LLaMA 在 16 GB DRAM 上的做法（expert-pack、`O_DIRECT`、無損壓縮）是最直接的參考；壓縮應該加進機制表，當作第 8 項候選。
+3. **第 7 節的問題「verify window 裡的 experts 重疊多少」**：可以先參考 2505.16056 的 SCH 指標怎麼定義，再拿自己錄的 `--dump-routing` trace 來算。
+4. **測量的嚴謹度**：Memory-Sovereign Inference 指出「行程記憶體不含 page cache」，Strata 的 mmap 模式剛好有這個問題。實測時要同時記錄系統的 free RAM，不能只看 engine 自己報的數字。
+5. **耗電**：SSD 路線省的是 DRAM 的錢，但每個 token 更耗電（2508.06978）。桌機可能不在意，筆電要考慮。
+
+### 建議閱讀順序
+
+1. Eliseev & Mazur（2312.17238）：短，讀完就懂 offloading 的基本問題
+2. Fiddler（2402.07033）：為什麼 CPU 直接算比搬資料好
+3. HOBBIT（2411.01433）：混合精度
+4. SSD-LLaMA（2609.18110）：SSD 當第三層，硬體條件最接近
+5. Not All Models Suit Expert Offloading（2505.16056）：怎麼量化「局部性」
+6. 其餘依興趣挑
